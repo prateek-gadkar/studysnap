@@ -1,0 +1,15 @@
+# Generated demo outputs
+studysnap_output.json
+whiteboard_output.json
+knowledge_base.json
+adaptive_state.json
+
+# Python cache and temporary image-processing output
+__pycache__/
+*.pyc
+debug/
+
+# Audio files used for local testing
+*.wav
+*.mp3
+*.m4a
