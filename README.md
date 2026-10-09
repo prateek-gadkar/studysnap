@@ -1,241 +1,265 @@
 # StudySnap
-### An offline-first lecture companion for students with unreliable internet
 
-**Built for:** Qualcomm Snapdragon® AI Lab Build & Present Challenge 2026
-**Category:** AI for Education / Accessibility
-**Target hardware:** Snapdragon-powered HP AI PCs
+### A source-cited study companion that runs entirely on the device
+
+Students record every lecture. Almost none of them can do anything useful with the
+recordings and the obvious fix, uploading the audio to a cloud service, fails for reasons
+that are economic and infrastructural rather than technical.
+
+StudySnap turns a lecture recording **and** a photograph of the whiteboard into revision
+material without a single byte leaving the device.
 
 ---
 
 ## The problem
 
-Every engineering and BCA student in India has recorded a lecture on their phone.
-Almost none of them can do anything useful with it.
-
-The obvious solution — upload the audio to a cloud transcription service — fails for
-reasons that have nothing to do with technology:
-
 | Barrier | Reality for a typical student |
 |---|---|
-| Cost | Cloud ASR APIs are priced in dollars; a student is budgeting in hundreds of rupees |
-| Data | 1 hour of lecture audio is ~115 MB uploaded before you get a single word back |
+| Cost | Cloud ASR is priced in dollars; a student budgets in hundreds of rupees |
+| Data | 1 hour of lecture audio is ~115 MB uploaded before a single word comes back |
 | Connectivity | Campus Wi-Fi drops in lecture halls. So does 4G in older buildings |
-| Privacy | Lecture recordings may contain a professor's voice, other students' questions, and internal course material nobody consented to uploading |
-| Battery | Continuously streaming audio to a cloud endpoint drains a laptop through a 3-hour lab session |
+| Privacy | Lecture audio contains other students' voices and internal course material |
+| Battery | Streaming audio to a server drains a laptop through a 3-hour lab session |
 
-So the recording sits in the phone's storage and the student re-watches it at 2x speed
-the night before the exam.
+So the recording sits in storage and gets re-watched at 2× speed the night before the exam,
+which is the least effective possible way to revise. Then there is the second problem:
+**the board**. The equations, the definitions, the diagrams — none of that is in the audio
+at all.
 
-**StudySnap turns that recording into revision material without a single byte leaving
-the laptop.**
+**The students who most need a study tool are the ones who can least afford the
+infrastructure the cloud version requires.** That is the constraint every design decision
+below follows from.
 
 ---
 
 ## What it does
 
-One pipeline, three outputs, zero network calls:
+Four runnable modules in one codebase. The core study workflow runs on-device; the optional Qualcomm AI Hub profiling path requires a network connection:
 
 ```
-lecture audio ──► on-device ASR ──► summary ──► flashcards
-   (.wav/.m4a)      (Whisper,        (key         (cloze
-                      NPU)           points)       deletion)
+   lecture audio ──────────┐
+                           ├──►  source-cited knowledge base  ──►  citations
+   board / textbook photo ─┘              │
+                                          ▼
+                              adaptive assessment engine
+                                          │
+                          ┌───────────────┴───────────────┐
+                          ▼                               ▼
+                  questions at the                 mastery tracking +
+                  right difficulty                  spaced repetition
 ```
 
-1. **Transcript** — speech-to-text runs locally on the Hexagon NPU
-2. **Summary** — the 5 most salient points, in the order they were spoken
-3. **Flashcards** — cloze-deletion cards generated from the summary sentences, ready
-   for spaced repetition
+1. **Audio** (`app.py`) — transcript → summary → flashcards
+2. **Vision** (`whiteboard.py`) — photograph a board or page → structured notes
+3. **Knowledge base** (`knowledge_base.py`) — every fact carries its source, precisely
+4. **Adaptive assessment** (`adaptive.py`) — question selection and scheduling per student
 
-Every step is local. Airplane mode is a supported configuration, not a bug.
+### The citations are the hard part
 
----
+Citing a source is easy. Citing it *precisely* is not, and a citation that lands in the
+wrong place is worse than no citation — the student clicks through and finds nothing.
 
-## Why on-device is the right architecture (not just the trendy one)
+The first implementation recorded only where each *chunk* began. A question about learning
+rates was answered correctly but cited `lecture.mp4 @ 00:00`, when the content is at
+`02:10`. Chunks are ~90 words and deliberately overlap, so a chunk's start point can be
+minutes away from the answer inside it.
 
-Cloud ASR is a *design* choice with a cost. On-device is the only architecture where
-the accessibility argument actually holds:
+Provenance is therefore tracked per **segment**: every chunk knows the timestamp or page
+number of each line inside it, and the answer's own sentence is located before citing. The
+same answer is now cited as `lecture.mp4 @ 02:10`.
 
-- **₹0 marginal cost.** Transcription is compute you already own. There is no per-minute meter.
-- **0 MB uploaded.** The audio never leaves the device.
-- **Works without connectivity.** The critical property — because the failure case for the
-  cloud version is *precisely* the student in a lecture hall with bad Wi-Fi.
-- **Privacy by construction.** Not a policy promise. There is no endpoint to breach.
-- **Battery-friendly.** NPU inference is dramatically more efficient than streaming audio
-  over a radio and waiting for a server, which is what makes a 3-hour lab session viable.
+### The system says "I don't know"
 
-The Snapdragon X Elite / X2 Hexagon NPU is what makes this practical rather than
-theoretical — it runs these models at a power envelope a thin-and-light laptop can
-sustain all day.
+`KnowledgeBase.ask()` returns `grounded=False` when nothing clears the relevance threshold,
+rather than returning the closest thing it can find:
+
+```
+Q: what is the capital of France?
+   confidence 0.0  grounded False
+   I could not find this in the provided material.
+```
+
+For a tool aimed at students, a confident wrong answer is the worst possible failure mode.
+An extractive system can guarantee this property; a generative one cannot.
+
+### The questions adapt to the student
+
+Question difficulty and student ability are measured on the same Elo scale. Selection
+targets the *desirable difficulty* band — roughly 70–85% expected success, where retrieval
+practice produces the most durable learning. Questions the student always gets right teach
+nothing; questions they always fail teach nothing either.
+
+```
+SIMULATED SESSION — one student, 30 questions
+ #  concept                diff P(correct)  result  ability      Δ
+ 1  overfitting model      1052       0.70       ✓   1209.6   +9.6
+ 2  gradient descent       1043       0.71       ✗   1177.2  -22.8
+ 3  momentum               1043       0.71       ✓   1209.2   +9.2
+
+realised success rate: 80%   (target band 70-85%)
+ability moved 1200 -> 1225
+```
+
+A correct answer to a hard question moves ability a lot; a correct answer to an easy one
+barely moves it. A wrong answer costs more than a right answer gains, which is what makes
+the estimate conservative and honest.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Snapdragon-powered HP AI PC                                 │
-│                                                              │
-│   mic / audio file                                           │
-│         │                                                    │
-│         ▼                                                    │
-│   ┌────────────────┐   compiled via Qualcomm AI Hub          │
-│   │  Whisper-Small │   → runs on Hexagon NPU                 │
-│   └────────┬───────┘                                         │
-│            │  transcript                                     │
-│            ▼                                                 │
-│   ┌────────────────┐   summarise + generate cloze cards      │
-│   │  small LLM     │   (NPU path, or deterministic NLP       │
-│   │  (instruct)    │    fallback when no model is present)   │
-│   └────────┬───────┘                                         │
-│            │                                                 │
-│       ┌────┴────┬──────────┐                                 │
-│       ▼         ▼          ▼                                 │
-│   summary   flashcards   keywords                            │
-│                                                              │
-│   ── no network calls anywhere in this diagram ──            │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  on-device                                                       │
+│                                                                  │
+│   audio ──► Whisper ──► transcript ──┐                           │
+│                                      │                           │
+│   photo ──► preprocess ──► OCR ──► notes ──┐                     │
+│             (deskew, Otsu,                 │                     │
+│              illumination)                 ▼                     │
+│                              ┌─────────────────────────┐         │
+│                              │  source-cited KB (BM25) │         │
+│                              │  timestamp / page       │         │
+│                              └───────────┬─────────────┘         │
+│                                          │                       │
+│                          ┌───────────────┴──────────────┐        │
+│                          ▼                              ▼        │
+│                   cited answers                  item generation │
+│                  (refuses to guess)                      │       │
+│                                            ┌─────────────┴────┐  │
+│                                            ▼                  ▼  │
+│                                    Elo ability      spaced       │
+│                                    estimation       repetition   │
+│                                                                  │
+│   ── core study workflow runs locally; no network calls ──       │
+└──────────────────────────────────────────────────────────────────┘
 ```
-
-Models are compiled and profiled for the target device through **Qualcomm AI Hub**
-(`qualcomm_npu.py`), which returns real on-device latency, peak memory, and the
-per-layer NPU/CPU execution split.
-
----
-
-## Measured NPU performance
-
-> Models are submitted for compilation; profiling on
-device pending.
 
 ---
 
 ## How to run it
 
-### Verify the pipeline immediately (no downloads, no network, ~1 second)
+Every module has a demo that runs with **no model downloads and no network**.
 
 ```bash
-python app.py --demo
+python3 app.py --demo            # audio pipeline: transcript → summary → flashcards
+python3 whiteboard.py --demo     # vision pipeline: board text → structured notes
+python3 knowledge_base.py --demo # cited question answering + refusal behaviour
+python3 adaptive.py --demo       # adaptive assessment + mastery report
 ```
 
-Runs the full transcript → summary → flashcards pipeline on a bundled sample lecture
-using the deterministic extractive path. This proves the back half of the pipeline
-works before you spend time on model setup — useful when you are demoing or recording
-on a deadline.
-
-### Process a real transcript
+### Real inputs
 
 ```bash
-python app.py --text lecture.txt --target "Snapdragon X Elite NPU"
+pip install faster-whisper pypdf pytesseract   # + the tesseract binary
+
+python3 app.py --audio lecture.m4a
+
+python3 whiteboard.py --image board.jpg --transcript lecture.txt --debug-dir debug/
+
+python3 knowledge_base.py \
+    --transcript lecture.txt \
+    --pdf textbook.pdf \
+    --slides slides.md \
+    --ask "why does a large learning rate cause problems?"
+
+python3 adaptive.py --kb knowledge_base.json
 ```
 
-### Process real lecture audio
+---
 
-```bash
-pip install faster-whisper
-python app.py --audio lecture.m4a
-```
+## Optional: hardware acceleration
 
-### Compile + profile the models for the NPU
+The default path is CPU. `qualcomm_npu.py` adds an optional compile-and-profile path via
+**Qualcomm AI Hub** for Snapdragon hardware. If you run it, it can collect on-device
+latency, peak memory and the per-layer NPU/CPU execution split. This profiling path
+requires a network connection; it is separate from the offline study workflow.
 
 ```bash
 pip install qai-hub qai-hub-models
-export QAI_HUB_API_TOKEN="<your token from app.aihub.qualcomm.com>"
-python qualcomm_npu.py --device "Snapdragon X Elite CRD"
+export QAI_HUB_API_TOKEN="<token from app.aihub.qualcomm.com>"
+python3 qualcomm_npu.py --device "Snapdragon X Elite CRD"
 ```
 
-### Save results as JSON
+> **Not measured yet.** The compile path is implemented; no profiling job has been run,
+> so no numbers are claimed here.
 
-```bash
-python app.py --demo --out run.json
-```
+| Metric | Value |
+|---|---|
+| Target device | *pending* |
+| Model | Whisper-Small |
+| Compile job ID | *pending* |
+| Inference latency | *pending* |
+| Peak memory | *pending* |
+| Compute unit | *pending* |
+
+This is an optimisation, not a dependency. Everything above runs without it.
 
 ---
 
-## Interactive demo (for the recorded walkthrough)
+## Two bugs worth reading about
 
-```bash
-python app.py --demo
-```
+Both were silent failures — the dangerous kind. They are documented because a system that
+claims to have no bugs is a system nobody has tested.
 
-Sample output shape:
+### 1. The deskew that did nothing
 
-```
-====================================================================
-StudySnap — lecture processed entirely on-device
-====================================================================
+`whiteboard.py` corrects camera tilt by rotating the image over a range of angles and
+picking the one that maximises the variance of the horizontal projection profile — text
+lines become sharp peaks when level.
 
-Inference target : Demo path — extractive NLP, no model download
-Pipeline time    : 0.0012s
+The first version profiled the whole frame. **Rotating an image fills the corners with a
+constant colour, and those blank wedges dominate the variance**, so the score increased
+monotonically with the angle and the search always returned its boundary value. It looked
+like it was working and was a no-op. Profiling only the central region, excluding the fill
+border, fixed it: the estimator now recovers 4.2° on an image rotated by 4.5°.
 
---- KEY CONCEPTS ---
-  • model  • data  • training  • precision  • recall
-  • validation  • test  • overfitting
+### 2. The concepts that never accumulated
 
---- SUMMARY ---
-  1. A dataset is normally divided into three parts: training data, ...
-  ...
+`adaptive.py` tracks mastery per concept. The first version labelled each *sentence* with
+its longest word, which turned a 31-question assessment into 26 distinct "concepts".
 
---- FLASHCARDS (5) ---
-  Q1: Fill in the blank: The ______ set is used to fit the model, ...
-       answer: training
-  ...
+The effect was not obvious in the output — the session ran, questions were asked, answers
+were recorded — but **every question arrived on a fresh concept with a fresh novice
+rating**, so ability never accumulated and mastery stayed pinned near zero no matter how
+well the student performed. The trace showed ability repeatedly resetting to 1200.
 
---- DATA / ACCESSIBILITY REPORT ---
-  approx_lecture_minutes: 2.3
-  data_a_cloud_asr_would_upload_gb: 0.004
-  cost_avoided_inr: 0.05
-  bytes_sent_to_network_by_studysnap: 0
-```
-
-That last line is the whole submission in one number. Swap in a real 60-minute lecture
-and it reads `0.115 GB` and `₹1.38` — per lecture, per student, forever.
-
----
-
-## Design decisions worth defending
-
-**Why an extractive fallback instead of requiring an LLM?**
-Two reasons. First, it makes the pipeline verifiable in under a second on any machine,
-which matters for graders and for iteration speed. Second, it demonstrates the pipeline
-is architecturally sound independent of which model sits in the middle — the summariser
-is a swappable component, not a load-bearing assumption.
-
-**Why generate flashcards instead of just a summary?**
-A summary is passive. Students re-read summaries and retain very little. Cloze-deletion
-cards feed a spaced-repetition loop, which is the mechanism with actual evidence behind
-it. The output format is chosen for retention, not for looking impressive in a demo.
-
-**Why not just use a speech-to-text app that already exists?**
-Because every one of them that is accurate enough to be useful is cloud-backed. The
-offline ones trade accuracy for privacy. On-device NPU inference removes that trade-off,
-which was only ever a hardware limitation.
+Labelling per *chunk* instead of per sentence gives one concept per coherent passage. The
+session now tracks 8 concepts and ability moves 1200 → 1225 as it should.
 
 ---
 
 ## Honest limitations
 
-Listing these deliberately — a submission that claims no weaknesses reads as untested.
-
-- The extractive summariser is TF-based, not semantic. It selects the most *statistically
-  salient* sentences, which is not always the same as the most *important* ones. The LLM
-  path is intended to replace it and is where the remaining quality gains live.
-- Whisper-Small is English-first. Indian-English accents, code-switching, and technical
-  jargon in Hinglish will degrade accuracy. Whisper-Medium or a fine-tune on Indian
-  lecture audio is the obvious next step.
-- Numbers quoted for data and cost saved are computed from a 115 MB/hour audio estimate
-  at a 16 kHz mono bitrate. Real bitrates vary; the constants are at the top of `app.py`
-  and are easy to correct.
-- No microphone capture UI yet — the current interface is CLI plus file input.
+- **Lecture video ingestion is not implemented.** Audio works; extracting slide frames from
+  a video is designed but not built. This is the largest remaining gap.
+- **Retrieval is BM25, not embeddings.** No model weights, instant on CPU, fully
+  inspectable — but it matches on terms, not meaning. "How do I stop a model memorising the
+  training data?" will not find a passage about overfitting unless the words overlap. A
+  hybrid with embeddings is the roadmapped upgrade; `BM25Index.search()` is the single
+  method that changes.
+- **Answers are extractive.** Nothing is generated, so nothing is hallucinated — but the
+  output can be a listing rather than an explanation. The two-sentence assembly in `ask()`
+  mitigates this; a generative layer with citation grounding would do better.
+- **Whisper-Small is English-first.** Indian-English accents, code-switching and technical
+  jargon will degrade accuracy.
+- **OCR needs the tesseract binary**, which is a system dependency, not a pip one.
+- **Adaptive difficulty seeds are heuristic**, derived from sentence properties (definition
+  vs prose, clause structure). They self-calibrate as items are answered, but the first pass
+  for a new item pool is approximate.
 
 ---
 
 ## Repository layout
 
 ```
-snapstudy/
-├── app.py             pipeline: transcribe → summarise → flashcards → report
-├── qualcomm_npu.py    AI Hub compile + profile for Snapdragon NPU
+├── app.py             audio pipeline: transcribe → summarise → flashcards → report
+├── whiteboard.py      vision pipeline: photo → preprocess → OCR → structured notes
+├── knowledge_base.py  cited knowledge base + BM25 retrieval + grounded QA
+├── adaptive.py        Elo ability estimation + adaptive item selection + spacing
+├── qualcomm_npu.py    optional AI Hub compile + profile path
 ├── requirements.txt
+├── .gitignore
 └── README.md
 ```
 
@@ -243,25 +267,21 @@ snapstudy/
 
 ## Roadmap
 
-1. Fine-tune Whisper on Indian-English lecture audio
-2. On-device voice-activity detection so recording starts and stops itself
-3. Spaced-repetition scheduler with an FSRS-style interval model
-4. Export to Anki / Quizlet
-5. Kannada and Hindi lecture support via multilingual Whisper
+1. **Lecture video ingestion** — extract audio *and* detect slide-change frames, so one
+   video yields both the transcript and the slides.
+2. **Hybrid retrieval** — BM25 plus embeddings, fused by reciprocal rank.
+3. **Fine-tune Whisper** on Indian-English lecture audio
+4. **Kannada and Hindi** lecture support via multilingual Whisper
+5. **Anki / Quizlet export** for the generated decks
 
 ---
 
 ## Background
 
-Built for the **Qualcomm Snapdragon AI Lab Build & Present Challenge 2026**, which asks
-for AI solutions designed or optimised for Snapdragon-powered HP PCs.
+The constraint driving every decision: **build for the student who currently has the least
+access.** That student is on a campus with unreliable Wi-Fi, paying for mobile data by the
+gigabyte, and cannot upload their lectures to a remote server. On-device
+inference is what makes the tool reach them.
 
-The design constraint driving every decision above: **build for the student who
-currently has the least access.** That student is on a campus with unreliable Wi-Fi,
-paying for mobile data by the gigabyte, and cannot upload their lectures to a server in
-another country. On-device inference is what makes the tool reach them.
-
-
-This attachment below is a working Demo of StudySnap
-
-<img width="1917" height="1137" alt="SnapStudy demo" src="https://github.com/user-attachments/assets/d02f551b-32ed-4735-8c33-532a71ff5dd2" />
+StudySnap has been developed and iterated across several student AI competitions during
+2026, and extended between them.
